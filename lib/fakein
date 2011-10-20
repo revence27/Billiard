@@ -1,0 +1,27 @@
+#!  /usr/bin/env ruby
+#   vim: bg=dark
+
+require 'socket'
+require 'thread'
+
+def handle_reqs con
+    until con.eof?
+        STDOUT.write(con.getc.chr)
+        STDOUT.flush
+    end
+    STDERR.puts(%[... Lost connection.])
+end
+
+def fmain args
+    TCPServer.open((args.first || '8989').to_i) do |srv|
+        STDERR.puts(%[Listening on #{args.first || 8989}])
+        while true
+            got = srv.accept
+            STDERR.puts(%[Got connection ...])
+            Thread.new {handle_reqs(got)}
+        end
+    end
+    return 0
+end
+
+exit(fmain(ARGV))
