@@ -1,0 +1,5 @@
+Billiard
+========
+This script interfaces between arbitrary scripts (which connect via a TCP socket) and an MML system, such as that of the Huawei INs.
+
+It takes JSON conf files, a sample of which is in `lib/conf.js`.
