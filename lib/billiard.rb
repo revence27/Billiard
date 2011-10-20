@@ -10,22 +10,26 @@ require 'socket'
 require 'thread'
 
 class INSocket
-    def initialize sck, friends
+    def initialize sck, frds
         @sck  = sck
-        @frds = friends
+        @frds = frds
         @svnm = 'SRVM'
         @tmnl = 'TERMINAL'
         @user = 'USERNAME'
-        @trc  = 1
         @kyu  = Queue.new
-        @thd  = Thread.new {send_items(@kyu, @sck)}
+        @trc  = 1
+        @trm  = Mutex.new
+        @mut  = Mutex.new
+        @rqs  = {'0' => proc {|x|}}
+        @thd  = Thread.new {send_items(@kyu, @sck, @mut)}
+        @rcv  = Thread.new {recv_items(@kyu, @sck, @mut)}
         @htb  = Thread.new {send_keep_alive}
     end
 
     def send_keep_alive
         while true
             sleep 120
-            @kyu << ['`SC`0004HBHBB7BDB7BD', proc {|x| }]
+            @kyu << ['`SC`0004HBHBB7BDB7BD', 0, {:exec => proc {|x| }}]
         end
     end
 
@@ -37,24 +41,65 @@ class INSocket
         $stderr.print got
         gat = sck.read(8)
         $stderr.puts gat
-        got[37 .. -1]
+        if len == 4 then
+            #   Heartbeat.
+            ['', 0]
+        else
+            ans = got[37 .. -1]
+            tid = got.match(/Dlg.{7}(.{8})/i)[1].to_i(16)
+            [ans, tid]
+        end
     end
 
-    def send_items kyu, sck
+    def recv_items kyu, sck, mut
+        while true
+            ans, tid = fetch_ack sck
+            mut.synchronize do
+                Thread.new do
+                    begin
+                        hdlr = @rqs.delete(tid.to_s)
+                        if hdlr then
+                            if hdlr[:exec] then
+                                hdlr[:exec].call(ans)
+                            elsif hdlr[:socket] then
+                                con = hdlr[:socket]
+                                con.write((%[%s] % [('%4X' % [ans.length]).gsub(/\s/, '0')]) + ans)
+                                _, _, fhst, fip = con.peeraddr
+                                $stderr.puts(%[<<< #{fhst} (#{fip}) #{Time.now}\n<<<] + ans)
+                            else
+                                raise ArgumentError.new(%[Handler #{hdlr.inspect} not understood.])
+                            end
+                            $stderr.puts(%[[[Response for transaction %d:#{hdlr.inspect}]]] % [tid])
+                        else
+                            $stderr.puts(%[Transaction #{tid} no exist!])
+                        end
+                    rescue Exception => e
+                        $stderr.puts(e.inspect, *e.backtrace)
+                    end
+                end
+            end
+        end
+    end
+
+    def send_items kyu, sck, mut
         while true
             got = kyu.pop
             $stderr.puts(%[IN>>> #{got.first}])
             sck.write(got.first)
             sck.flush
-            ans = fetch_ack sck
-            got.last.call ans
-            #   Thread.new {got.last.call(fetch_ack(sck))}
+            $stderr.puts(%[[[Transaction %d:#{got.last}]]] % [got[1]])
+            mut.synchronize do
+                @rqs[got[1].to_s] = got.last
+            end
         end
     end
 
     def next_trans_id
         it = @trc
-        @trc = @trc + 1
+        @trm.synchronize do
+            it = @trc
+            @trc = @trc + 1
+        end
         it
     end
 
@@ -75,14 +120,20 @@ class INSocket
         rez.split('').map {|x| ('%2X' % [x[0]]).gsub(/\s/, '0')}.join
     end
 
-    def send cmd, stp = nil, ctl = 'Con', &blk
-        raise ArgumentError.new(%[Who handles the result?]) unless block_given?
+    def send cmd, stp = nil, ctl = 'Con', con = nil
+        hdl = if not con then
+            raise ArgumentError.new(%[Who handles the result?]) unless block_given?
+            {:exec => proc {|x| yield(x)}}
+        else
+            con
+        end
         t1 = %[#{@tmnl}        ][0, 8]
         s1 = %[#{stp || @svnm}        ][0, 8]
-        msghdr = %[1.00#{t1}#{s1}]
         c1 = %[#{ctl}Con][0, 3].upcase
+        msghdr = %[1.00#{t1}#{s1}]
         seshdr = %[00000001DLG#{c1}0000]
-        trshdr = %[%sTXBEG 0000] % [('%8X' % [next_trans_id]).gsub(/\s/, '0')]
+        tid    = next_trans_id
+        trshdr = %[%sTXBEG 0000] % [('%8X' % [tid]).gsub(/\s/, '0')]
         lack   = cmd.length % 4
         oprmsg = if lack.zero? then
                      cmd
@@ -93,7 +144,7 @@ class INSocket
         msgln  = tailer.length
         chksm  = make_checksum(tailer)
         rez    = '`SC`%s%s%s' % [('%4X' % [msgln]).gsub(/\s/, '0'), tailer, chksm[0, 8]]
-        @kyu << [rez, blk]
+        @kyu << [rez, tid, hdl]
     end
 
     def authenticate svid, tmnl, user, pwd
@@ -115,18 +166,24 @@ class INSocket
                     con.puts(%[Access denied.])
                     con.close
                 else
-                    Thread.new do
-                        $stderr.puts(%[Client [#{fhst} (#{fip}) #{Time.now}] connected ...])
-                        con.each_line do |ln|
-                            got = ln.chomp
-                            $stderr.puts(%[>>> #{fhst} (#{fip}) #{Time.now} >>>] + got)
-                            send(got, 'EPPC') do |rez|
-                                con.write((%[%s] % [('%4X' % [rez.length]).gsub(/\s/, '0')]) + rez)
-                                $stderr.puts(%[<<< #{fhst} (#{fip}) #{Time.now} <<<] + rez)
+                    Thread.new(con) do |ncon|
+                        begin
+                            $stderr.puts(%[Client [#{fhst} (#{fip}) #{Time.now}] connected ...])
+                            ncon.each_line do |ln|
+                                got = ln.chomp
+                                if got.strip.empty? then
+                                    nil
+                                else
+                                    $stderr.puts(%[>>> #{fhst} (#{fip}) #{Time.now} >>>] + got)
+                                    send(got, 'EPPC', 'Con', {:socket => ncon})
+                                end
                             end
+                            ncon.close
+                            $stderr.puts(%[... client [#{fhst} (#{fip}) #{Time.now}] disconnected.])
+                        rescue Exception => e
+                            $stderr.puts(%[Connection error for #{fhst}:#{fip} (#{e.inspect})])
+                            ncon.close
                         end
-                        con.close
-                        $stderr.puts(%[... client [#{fhst} (#{fip}) #{Time.now}] disconnected.])
                     end
                 end
             end
@@ -143,9 +200,9 @@ class INSocket
 end
 
 class INConnection
-    def initialize inhst, inprt, friends
+    def initialize inhst, inprt, frds
         TCPSocket.open(inhst, inprt) do |srv|
-            inc = INSocket.new(srv, Set.new(friends))
+            inc = INSocket.new(srv, Set.new(frds))
             yield(inc)
             inc.close
         end
@@ -156,9 +213,7 @@ def bmain args
     args << %[/etc/billiard/conf.js] if args.empty?
     File.open(args.first) do |f|
         cnf = JSON.parse(f.read)
-        if cnf['logfile'] then
-            $stderr = File.open(cnf['logfile'], 'a')
-        end
+        $stderr = File.open(cnf['logfile'], 'a') if cnf['logfile']
         INConnection.new(cnf['in']['host'], cnf['in']['port'], cnf['service']['friends']) do |inc|
             inc.authenticate(cnf['service']['id'], cnf['service']['terminal'], cnf['in']['user'], cnf['in']['password'])
             inc.run_requests(cnf['service']['port'])
