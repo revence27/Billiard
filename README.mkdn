@@ -1,5 +1,8 @@
 Billiard
 ========
-This script interfaces between arbitrary scripts (which connect via a TCP socket) and an MML system, such as that of the Huawei INs.
+This script interfaces between arbitrary scripts (which connect via a TCP socket) and an MML system, such as that of the Huawei INs (with which it has been tested).
+
+The system can then enforce whitelisting, and logging and other arbitrary rules.
+It has been tested with hundreds of connections per second.
 
 It takes JSON conf files, a sample of which is in `lib/conf.js`.
