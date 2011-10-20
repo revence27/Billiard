@@ -3,14 +3,16 @@
 #   Billiard 0.1
 #   vim: bg=dark
 
+require 'rubygems'
+require 'json'
+require 'set'
 require 'socket'
 require 'thread'
 
-FRIENDS_BY_IP = %w[172.16.0.2]
-
 class INSocket
-    def initialize sck
+    def initialize sck, friends
         @sck  = sck
+        @frds = friends
         @svnm = 'SRVM'
         @tmnl = 'TERMINAL'
         @user = 'USERNAME'
@@ -29,19 +31,19 @@ class INSocket
 
     def fetch_ack sck
         got = sck.read(8)
-        STDERR.print('>>> ' + got)
+        $stderr.print('>>> ' + got)
         len = got[4, 4].to_i(16)
         got = sck.read(len)
-        STDERR.print got
+        $stderr.print got
         gat = sck.read(8)
-        STDERR.puts gat
+        $stderr.puts gat
         got[37 .. -1]
     end
 
     def send_items kyu, sck
         while true
             got = kyu.pop
-            STDERR.puts(%[IN>>> #{got.first}])
+            $stderr.puts(%[IN>>> #{got.first}])
             sck.write(got.first)
             sck.flush
             ans = fetch_ack sck
@@ -108,23 +110,23 @@ class INSocket
             while true
                 con = srv.accept
                 _, __, fhst, fip = con.peeraddr
-                unless FRIENDS_BY_IP.member?(fip) then
-                    STDERR.puts(%[Access denied: #{fhst} (#{fip})])
+                unless @frds.member?(fip) then
+                    $stderr.puts(%[Access denied: #{fhst} (#{fip})])
                     con.puts(%[Access denied.])
                     con.close
                 else
                     Thread.new do
-                        STDERR.puts(%[Client [#{fhst} (#{fip}) #{Time.now}] connected ...])
+                        $stderr.puts(%[Client [#{fhst} (#{fip}) #{Time.now}] connected ...])
                         con.each_line do |ln|
                             got = ln.chomp
-                            STDERR.puts(%[>>> #{fhst} (#{fip}) #{Time.now} >>>] + got)
+                            $stderr.puts(%[>>> #{fhst} (#{fip}) #{Time.now} >>>] + got)
                             send(got, 'EPPC') do |rez|
                                 con.write((%[%s] % [('%4X' % [rez.length]).gsub(/\s/, '0')]) + rez)
-                                STDERR.puts(%[<<< #{fhst} (#{fip}) #{Time.now} <<<] + rez)
+                                $stderr.puts(%[<<< #{fhst} (#{fip}) #{Time.now} <<<] + rez)
                             end
                         end
                         con.close
-                        STDERR.puts(%[... client [#{fhst} (#{fip}) #{Time.now}] disconnected.])
+                        $stderr.puts(%[... client [#{fhst} (#{fip}) #{Time.now}] disconnected.])
                     end
                 end
             end
@@ -141,9 +143,9 @@ class INSocket
 end
 
 class INConnection
-    def initialize inhst, inprt
+    def initialize inhst, inprt, friends
         TCPSocket.open(inhst, inprt) do |srv|
-            inc = INSocket.new srv
+            inc = INSocket.new(srv, Set.new(friends))
             yield(inc)
             inc.close
         end
@@ -151,15 +153,21 @@ class INConnection
 end
 
 def bmain args
-    if args.length < 7 then
-        STDERR.puts(%[#{$0} in-host in-port billiard-port service-id terminal user password])
-        return 1
+    args << %[/etc/billiard/conf.js] if args.empty?
+    File.open(args.first) do |f|
+        cnf = JSON.parse(f.read)
+        if cnf['logfile'] then
+            $stderr = File.open(cnf['logfile'], 'a')
+        end
+        INConnection.new(cnf['in']['host'], cnf['in']['port'], cnf['service']['friends']) do |inc|
+            inc.authenticate(cnf['service']['id'], cnf['service']['terminal'], cnf['in']['user'], cnf['in']['password'])
+            inc.run_requests(cnf['service']['port'])
+        end
     end
-    INConnection.new(args.first, args[1].to_i) do |inc|
-        inc.authenticate(args[3], args[4], args[5], args[6])
-        inc.run_requests(args[2].to_i)
-    end
-    return 0
+    0
+rescue Exception => e
+    $stderr.puts(e.inspect, *e.backtrace)
+    1
 end
 
 exit(bmain(ARGV))
